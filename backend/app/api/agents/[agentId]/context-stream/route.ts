@@ -2,9 +2,20 @@ export const runtime = "nodejs";
 
 import { store } from "@/lib/storage";
 import { getAgentRuntime } from "@/runtime/agent-runtime";
+import { getUpstashRealtime, isUpstashRealtimeConfigured } from "@/runtime/upstash-realtime";
 
 function sse(data: unknown) {
   return new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sseWithId(id: string | number | null | undefined, data: unknown) {
+  const prefix =
+    typeof id === "string"
+      ? `id: ${id}\n`
+      : typeof id === "number"
+        ? `id: ${id}\n`
+        : "";
+  return new TextEncoder().encode(`${prefix}data: ${JSON.stringify(data)}\n\n`);
 }
 
 export async function GET(
@@ -12,48 +23,83 @@ export async function GET(
   { params }: { params: Promise<{ agentId: string }> }
 ) {
   const { agentId } = await params;
+  const url = new URL(req.url);
+  const groupId = url.searchParams.get("groupId") ?? null;
   const runtime = getAgentRuntime();
   await runtime.bootstrap();
 
-  const lastEventId = Number(req.headers.get("Last-Event-ID") ?? "0");
+  const lastEventIdHeader = (req.headers.get("Last-Event-ID") ?? "").trim();
+  const lastEventNumericId = Number(lastEventIdHeader || "0");
   const agent = await store.getAgent({ agentId });
   if (agent.role !== "human") {
     void runtime.wakeAgent(agentId);
   }
   const history = (() => {
     try {
-      const parsed = JSON.parse(agent.llmHistory) as Array<{ role: string; content: string }>;
-      return Array.isArray(parsed) ? parsed : [];
+      const parsed = JSON.parse(agent.llmHistory) as unknown;
+      if (Array.isArray(parsed)) return parsed as Array<{ role: string; content: string }>;
+      if (parsed && typeof parsed === "object" && groupId) {
+        const byGroup = parsed as Record<string, Array<{ role: string; content: string }>>;
+        return Array.isArray(byGroup[groupId]) ? byGroup[groupId] : [];
+      }
+      return [];
     } catch {
       return [];
     }
   })();
 
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const send = (payload: unknown) => controller.enqueue(sse(payload));
+    async start(controller) {
+      const send = (payload: any) => {
+        if (payload && typeof payload === "object" && typeof payload.id === "number") {
+          controller.enqueue(sseWithId(payload.id, payload));
+          return;
+        }
+        controller.enqueue(sse(payload));
+      };
       const sendKeepalive = () => controller.enqueue(new TextEncoder().encode(`: ping\n\n`));
 
       send({ event: "agent.history", data: { history } });
 
-      for (const evt of runtime.bus.getSince(agentId, lastEventId)) {
-        send(evt);
-      }
+      let unsubscribe: (() => void) | null = null;
+      let upstashUnsubscribe: (() => void) | null = null;
 
-      const unsubscribe = runtime.bus.subscribe(agentId, (evt) => {
-        send(evt);
-      });
+      if (isUpstashRealtimeConfigured()) {
+        const channel = getUpstashRealtime().channel(`agent:${agentId}`);
+
+        const start = lastEventIdHeader ? `(${lastEventIdHeader}` : "-";
+        upstashUnsubscribe = await channel.subscribe({
+          events: ["agent.history", "agent.stream", "agent.done", "agent.error"],
+          history: { start: start as any, end: "+" as any, limit: 2000 },
+          onData: (evt) => {
+            // evt shape: { id: string, channel: string, event: string, data: unknown }
+            const payload = {
+              event: evt.event,
+              data: (evt.data as any)?.data ?? evt.data,
+            };
+            controller.enqueue(sseWithId((evt as any).id, payload));
+          },
+        });
+      } else {
+        for (const evt of runtime.bus.getSince(agentId, lastEventNumericId)) {
+          send(evt);
+        }
+        unsubscribe = runtime.bus.subscribe(agentId, (evt) => {
+          send(evt);
+        });
+      }
 
       const keepalive = setInterval(sendKeepalive, 15_000);
 
-      const abortHandler = () => {
+      const abortHandler = async () => {
         clearInterval(keepalive);
-        unsubscribe();
+        unsubscribe?.();
+        upstashUnsubscribe?.();
         controller.close();
       };
 
-      if (req.signal.aborted) abortHandler();
-      req.signal.addEventListener("abort", abortHandler, { once: true });
+      if (req.signal.aborted) void abortHandler();
+      req.signal.addEventListener("abort", () => void abortHandler(), { once: true });
     },
   });
 
